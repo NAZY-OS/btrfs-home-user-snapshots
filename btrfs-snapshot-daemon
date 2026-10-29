@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import pwd
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME_ROOT = Path("/home")
+MANAGER = Path(__file__).with_name("btrfs-snapshot-manager")
+
+
+def run_daemon(interval):
+    if os.geteuid() != 0:
+        print("The snapshot daemon must run as root.", file=sys.stderr)
+        return 1
+
+    if not MANAGER.is_file():
+        print(f"Snapshot manager not found: {MANAGER}", file=sys.stderr)
+        return 1
+
+    print(f"Watching /home for users; checking every {interval} seconds.")
+
+    while True:
+        for account in pwd.getpwall():
+            # Skip typical system accounts and the nobody account.
+            if account.pw_uid < 1000 or account.pw_name == "nobody":
+                continue
+
+            home = HOME_ROOT / account.pw_name
+            if not home.is_dir():
+                continue
+
+            result = subprocess.run(
+                [
+                    str(MANAGER),
+                    "create",
+                    account.pw_name,
+                    "--daily",
+                    "--quiet",
+                ],
+                text=True,
+                capture_output=True,
+            )
+
+            if result.returncode != 0:
+                detail = result.stderr.strip() or result.stdout.strip()
+                print(
+                    f"Could not snapshot {account.pw_name}: {detail}",
+                    file=sys.stderr,
+                )
+
+        time.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check for home directories and create daily Btrfs snapshots."
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version="btrfs-snapshot-daemon 1.0.0",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Account scan interval in seconds (default: 5)",
+    )
+
+    args = parser.parse_args()
+
+    if args.interval < 1:
+        parser.error("--interval must be at least 1 second")
+
+    return run_daemon(args.interval)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
