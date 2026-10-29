@@ -1,0 +1,274 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import os
+import pwd
+import stat
+import subprocess
+import sys
+from pathlib import Path
+
+HOME_ROOT = Path("/home")
+SNAPSHOT_ROOT = HOME_ROOT / ".snapshots"
+
+
+class SnapshotError(Exception):
+    pass
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SnapshotError("Creating snapshots requires root privileges.")
+
+
+def get_account(username):
+    try:
+        return pwd.getpwnam(username)
+    except KeyError:
+        raise SnapshotError(f"Unknown user: {username}")
+
+
+def check_btrfs_subvolume(path):
+    if path.is_symlink() or not path.is_dir():
+        raise SnapshotError(f"Not a real directory: {path}")
+
+    result = subprocess.run(
+        ["btrfs", "subvolume", "show", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise SnapshotError(f"Not a Btrfs subvolume: {path}")
+
+
+def ensure_snapshot_root():
+    if SNAPSHOT_ROOT.is_symlink():
+        raise SnapshotError(f"Refusing symlink: {SNAPSHOT_ROOT}")
+
+    SNAPSHOT_ROOT.mkdir(mode=0o711, exist_ok=True)
+    info = SNAPSHOT_ROOT.lstat()
+
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        raise SnapshotError(
+            f"Snapshot root must be a real directory owned by root: "
+            f"{SNAPSHOT_ROOT}"
+        )
+
+    if stat.S_IMODE(info.st_mode) & 0o022:
+        raise SnapshotError(
+            f"Snapshot root must not be writable by group or other users: "
+            f"{SNAPSHOT_ROOT}"
+        )
+
+    os.chmod(SNAPSHOT_ROOT, 0o711)
+
+
+def get_user_snapshot_dir(account, create=False):
+    if create:
+        ensure_snapshot_root()
+
+    if not SNAPSHOT_ROOT.exists():
+        return None
+
+    if SNAPSHOT_ROOT.is_symlink():
+        raise SnapshotError(f"Refusing symlink: {SNAPSHOT_ROOT}")
+
+    root_info = SNAPSHOT_ROOT.lstat()
+    if not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != 0:
+        raise SnapshotError(f"Unsafe snapshot root: {SNAPSHOT_ROOT}")
+
+    user_dir = SNAPSHOT_ROOT / account.pw_name
+
+    if user_dir.is_symlink():
+        raise SnapshotError(f"Refusing symlink: {user_dir}")
+
+    if not user_dir.exists():
+        if not create:
+            return None
+        user_dir.mkdir(mode=0o700)
+
+    info = user_dir.lstat()
+    if not stat.S_ISDIR(info.st_mode):
+        raise SnapshotError(f"Not a directory: {user_dir}")
+
+    if create:
+        if not shutil_which("setfacl"):
+            raise SnapshotError(
+                "The 'setfacl' command is required to set owner-only access. "
+                "Install the system ACL tools."
+            )
+
+        # The directory itself remains root-owned. Only the named account
+        # receives read and traverse permissions through a POSIX ACL.
+        os.chown(user_dir, 0, 0)
+        os.chmod(user_dir, 0o700)
+
+        result = subprocess.run(
+            [
+                "setfacl",
+                "-m",
+                f"u:{account.pw_uid}:rx,g::---,o::---",
+                str(user_dir),
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise SnapshotError(f"Could not set snapshot directory ACL: {detail}")
+
+    else:
+        if info.st_uid != 0:
+            raise SnapshotError(f"Snapshot directory is not owned by root: {user_dir}")
+
+    return user_dir
+
+
+def shutil_which(command):
+    """Small standard-library-free-from-extra-import helper."""
+    from shutil import which
+
+    return which(command)
+
+
+def create_snapshot(username, daily=False, quiet=False):
+    require_root()
+    account = get_account(username)
+    source = HOME_ROOT / account.pw_name
+
+    check_btrfs_subvolume(source)
+    user_dir = get_user_snapshot_dir(account, create=True)
+
+    if daily:
+        snapshot_name = f"daily-{dt.date.today().isoformat()}"
+    else:
+        snapshot_name = "manual-" + dt.datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S-%f"
+        )
+
+    destination = user_dir / snapshot_name
+
+    if os.path.lexists(destination):
+        if daily:
+            return False
+        raise SnapshotError(f"Snapshot already exists: {destination}")
+
+    # No "-r": this creates a writable snapshot.
+    result = subprocess.run(
+        ["btrfs", "subvolume", "snapshot", str(source), str(destination)],
+        text=True,
+        capture_output=True,
+    )
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SnapshotError(f"Snapshot failed for {username}: {detail}")
+
+    if not quiet:
+        print(f"Created writable snapshot: {destination}")
+
+    return True
+
+
+def list_user_snapshots(username):
+    account = get_account(username)
+    user_dir = get_user_snapshot_dir(account, create=False)
+
+    if user_dir is None:
+        print(f"No snapshots for {username}.")
+        return
+
+    snapshots = sorted(
+        path.name
+        for path in user_dir.iterdir()
+        if path.is_dir() and not path.is_symlink()
+    )
+
+    if not snapshots:
+        print(f"No snapshots for {username}.")
+        return
+
+    print(f"Snapshots for {username}:")
+    for snapshot_name in snapshots:
+        print(f"  {snapshot_name}")
+
+
+def list_command(username=None):
+    current_username = pwd.getpwuid(os.getuid()).pw_name
+
+    if os.geteuid() != 0:
+        if username is not None and username != current_username:
+            raise SnapshotError(
+                "Non-root users may list only their own snapshots."
+            )
+        list_user_snapshots(current_username)
+        return
+
+    if username:
+        list_user_snapshots(username)
+        return
+
+    if not SNAPSHOT_ROOT.is_dir():
+        print("No snapshots found.")
+        return
+
+    for user_dir in sorted(SNAPSHOT_ROOT.iterdir()):
+        if user_dir.is_symlink() or not user_dir.is_dir():
+            continue
+        try:
+            get_account(user_dir.name)
+        except SnapshotError:
+            continue
+        list_user_snapshots(user_dir.name)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Create and list writable Btrfs home-directory snapshots."
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version="btrfs-snapshot-manager 1.0.0",
+    )
+
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    create_parser = commands.add_parser("create", help="Create a snapshot")
+    create_parser.add_argument(
+        "username",
+        nargs="?",
+        help="Account name; defaults to the current account",
+    )
+    create_parser.add_argument(
+        "--daily",
+        action="store_true",
+        help="Use the daily snapshot name; intended for the daemon",
+    )
+    create_parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress successful creation messages",
+    )
+
+    list_parser = commands.add_parser("list", help="List snapshots")
+    list_parser.add_argument("username", nargs="?", help="Account name")
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "create":
+            username = args.username or pwd.getpwuid(os.getuid()).pw_name
+            create_snapshot(username, daily=args.daily, quiet=args.quiet)
+        elif args.command == "list":
+            list_command(args.username)
+    except (SnapshotError, OSError, subprocess.SubprocessError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
