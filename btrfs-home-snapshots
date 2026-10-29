@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import os
+import pwd
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME_ROOT = Path("/home")
+SNAPSHOT_ROOT = HOME_ROOT / ".snapshots"
+
+
+class SnapshotError(Exception):
+    pass
+
+
+def require_root():
+    if os.geteuid() != 0:
+        raise SnapshotError("This command must be run as root.")
+
+
+def get_account(username):
+    try:
+        return pwd.getpwnam(username)
+    except KeyError:
+        raise SnapshotError(f"Unknown user: {username}")
+
+
+def check_subvolume(path):
+    if path.is_symlink() or not path.is_dir():
+        raise SnapshotError(f"Not a real directory: {path}")
+
+    result = subprocess.run(
+        ["btrfs", "subvolume", "show", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if result.returncode != 0:
+        raise SnapshotError(f"Not a Btrfs subvolume: {path}")
+
+
+def ensure_snapshot_directory(account):
+    """Create protected snapshot directories and return the user's directory."""
+    if SNAPSHOT_ROOT.is_symlink():
+        raise SnapshotError(f"Refusing symlink: {SNAPSHOT_ROOT}")
+
+    SNAPSHOT_ROOT.mkdir(mode=0o711, parents=True, exist_ok=True)
+    root_stat = SNAPSHOT_ROOT.stat()
+
+    if not stat.S_ISDIR(root_stat.st_mode) or root_stat.st_uid != 0:
+        raise SnapshotError(f"Unsafe snapshot directory: {SNAPSHOT_ROOT}")
+
+    os.chmod(SNAPSHOT_ROOT, 0o711)
+
+    user_dir = SNAPSHOT_ROOT / account.pw_name
+    if user_dir.is_symlink():
+        raise SnapshotError(f"Refusing symlink: {user_dir}")
+
+    user_dir.mkdir(mode=0o500, exist_ok=True)
+    os.chown(user_dir, account.pw_uid, account.pw_gid)
+    os.chmod(user_dir, 0o500)
+
+    return user_dir
+
+
+def make_snapshot(username, daily=False):
+    require_root()
+    account = get_account(username)
+    source = HOME_ROOT / account.pw_name
+
+    check_subvolume(source)
+    user_dir = ensure_snapshot_directory(account)
+
+    if daily:
+        snapshot_name = "daily-" + dt.date.today().isoformat()
+    else:
+        snapshot_name = "manual-" + dt.datetime.now().strftime(
+            "%Y-%m-%d_%H-%M-%S"
+        )
+
+    destination = user_dir / snapshot_name
+
+    if destination.exists():
+        return False
+
+    # No "-r": this creates a writable snapshot.
+    result = subprocess.run(
+        ["btrfs", "subvolume", "snapshot", str(source), str(destination)],
+        text=True,
+        capture_output=True,
+    )
+
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SnapshotError(f"Snapshot failed for {username}: {detail}")
+
+    print(f"Created writable snapshot: {destination}")
+    return True
+
+
+def list_user_snapshots(username):
+    account = get_account(username)
+    user_dir = SNAPSHOT_ROOT / account.pw_name
+
+    if not user_dir.is_dir():
+        print(f"No snapshots for {username}.")
+        return
+
+    snapshots = sorted(
+        path.name for path in user_dir.iterdir() if path.is_dir()
+    )
+
+    if not snapshots:
+        print(f"No snapshots for {username}.")
+        return
+
+    print(f"Snapshots for {username}:")
+    for name in snapshots:
+        print(f"  {name}")
+
+
+def list_command(username=None):
+    current_username = pwd.getpwuid(os.getuid()).pw_name
+
+    if os.geteuid() != 0:
+        if username is not None and username != current_username:
+            raise SnapshotError(
+                "Non-root users may list only their own snapshots."
+            )
+        list_user_snapshots(current_username)
+        return
+
+    if username is not None:
+        list_user_snapshots(username)
+        return
+
+    if not SNAPSHOT_ROOT.is_dir():
+        print("No snapshots found.")
+        return
+
+    user_dirs = sorted(path for path in SNAPSHOT_ROOT.iterdir() if path.is_dir())
+
+    if not user_dirs:
+        print("No snapshots found.")
+        return
+
+    for user_dir in user_dirs:
+        list_user_snapshots(user_dir.name)
+
+
+def daemon(interval):
+    require_root()
+    print(f"Watching /home for users; checking every {interval} seconds.")
+
+    while True:
+        # Skip typical system accounts.
+        for account in pwd.getpwall():
+            if account.pw_uid < 1000 or account.pw_name == "nobody":
+                continue
+
+            home = HOME_ROOT / account.pw_name
+            if not home.is_dir():
+                continue
+
+            try:
+                created = make_snapshot(account.pw_name, daily=True)
+                if not created:
+                    print(
+                        f"Today's snapshot already exists for "
+                        f"{account.pw_name}."
+                    )
+            except SnapshotError as exc:
+                print(f"Skipping {account.pw_name}: {exc}", file=sys.stderr)
+
+        time.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Create and list writable Btrfs snapshots of /home user "
+            "directories."
+        )
+    )
+    parser.add_argument(
+        "-v",
+        "--version",
+        action="version",
+        version="btrfs-home-snapshots 1.0.0",
+    )
+
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    create_parser = commands.add_parser(
+        "create", help="Create a manual snapshot"
+    )
+    create_parser.add_argument(
+        "username",
+        nargs="?",
+        help="Account name; defaults to the current user",
+    )
+
+    list_parser = commands.add_parser("list", help="List snapshots")
+    list_parser.add_argument("username", nargs="?", help="Account name")
+
+    daemon_parser = commands.add_parser(
+        "daemon", help="Check for users and create daily snapshots"
+    )
+    daemon_parser.add_argument(
+        "--interval",
+        type=int,
+        default=5,
+        help="Check interval in seconds (default: 5)",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        if args.command == "create":
+            username = args.username or pwd.getpwuid(os.getuid()).pw_name
+            make_snapshot(username)
+
+        elif args.command == "list":
+            list_command(args.username)
+
+        elif args.command == "daemon":
+            if args.interval < 1:
+                raise SnapshotError("--interval must be at least 1 second.")
+            daemon(args.interval)
+
+    except (SnapshotError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
