@@ -1,44 +1,46 @@
-# Btrfs Home Snapshots
+# Btrfs Home Snapshot Tools
 
-A small Python script for creating and listing **writable Btrfs snapshots** of user home directories under `/home`.
+Two small Python scripts for creating and listing **writable Btrfs snapshots** of user home directories:
 
-The script can create snapshots manually or run as a systemd service. The service checks for eligible user accounts every five seconds and creates at most one daily snapshot per user.
+- `btrfs-snapshot-manager` creates and lists snapshots.
+- `btrfs-snapshot-daemon` checks for eligible accounts and requests daily snapshots.
 
-## Features
+Snapshots are stored under `/home/.snapshots/<username>/`.
 
-- Creates writable Btrfs snapshots of `/home/<username>`.
-- Stores snapshots under `/home/.snapshots/<username>/`.
-- Creates manual snapshots on request.
-- Creates one daily snapshot per eligible user.
-- Detects newly created eligible accounts by checking the system account list.
-- Lets non-root users list only their own snapshots.
-- Lets root create and list snapshots for any user.
-- Provides `--help` / `-h` and `--version` / `-v` options.
+## Access control
+
+The snapshot directory for each account is owned by root. A POSIX ACL grants that account read and traverse access to its directory. Other users are not granted access; root can access all snapshots.
+
+The ACL is set with `setfacl`, so the system must have the ACL utilities installed. If the account's home directory is a Btrfs subvolume, the snapshot itself is writable, but its path is protected by the per-user snapshot directory.
 
 ## Requirements
 
 - Linux with Btrfs.
 - Python 3.
-- The Btrfs command-line tools, usually provided by the `btrfs-progs` package.
+- Btrfs command-line tools, usually provided by the `btrfs-progs` package.
+- ACL tools providing `setfacl`.
 - `/home/<username>` must be a Btrfs subvolume.
 - `/home/.snapshots` must be on the same Btrfs filesystem as the home subvolumes.
-- Root privileges to create snapshots or run the service.
+- Root privileges to create snapshots or run the daemon.
 
 ## Installation
 
-Save the script as:
+Install both scripts in the same directory:
 
 ```text
-/usr/local/sbin/btrfs-home-snapshots
+/usr/local/sbin/btrfs-snapshot-manager
+/usr/local/sbin/btrfs-snapshot-daemon
 ```
 
-Make it executable:
+Make them executable:
 
 ```bash
-sudo chmod 755 /usr/local/sbin/btrfs-home-snapshots
+sudo chmod 755 \
+  /usr/local/sbin/btrfs-snapshot-manager \
+  /usr/local/sbin/btrfs-snapshot-daemon
 ```
 
-The script uses `/home/<username>` as the source path. It does not use the home directory path recorded in the system account database.
+The scripts use `/home/<username>` as the source path. They do not use the home-directory path recorded in the account database.
 
 ## Usage
 
@@ -47,53 +49,56 @@ The script uses `/home/<username>` as the source path. It does not use the home 
 Create a snapshot for the current account:
 
 ```bash
-btrfs-home-snapshots create
+sudo btrfs-snapshot-manager create
 ```
 
-Create a snapshot for a named account:
+Create one for a named account:
 
 ```bash
-sudo btrfs-home-snapshots create alice
+sudo btrfs-snapshot-manager create alice
 ```
 
-Manual snapshots are named with a timestamp, for example:
+Manual snapshots use a timestamp in their name, for example:
 
 ```text
-/home/.snapshots/alice/manual-2026-10-29_12-30-00
+/home/.snapshots/alice/manual-2026-10-29_12-30-00-123456
 ```
 
 ### List snapshots
 
-List the current user's snapshots:
+A non-root user can list only their own snapshots:
 
 ```bash
-btrfs-home-snapshots list
+btrfs-snapshot-manager list
 ```
 
-A non-root user can list only their own snapshots. Root can list one user's snapshots:
+Root can list one account's snapshots:
 
 ```bash
-sudo btrfs-home-snapshots list alice
+sudo btrfs-snapshot-manager list alice
 ```
 
-Root can list snapshots for all users:
+Root can list snapshots for all accounts:
 
 ```bash
-sudo btrfs-home-snapshots list
+sudo btrfs-snapshot-manager list
 ```
 
 ### Help and version
 
 ```bash
-btrfs-home-snapshots --help
-btrfs-home-snapshots --version
+btrfs-snapshot-manager --help
+btrfs-snapshot-manager --version
+
+btrfs-snapshot-daemon --help
+btrfs-snapshot-daemon --version
 ```
 
-The `-h` and `-v` short options are also available.
+Both scripts also support `-h` and `-v`.
 
-## Run the daily snapshot service
+## Run the daily daemon with systemd
 
-Create `/etc/systemd/system/btrfs-home-snapshots.service`:
+Create `/etc/systemd/system/btrfs-snapshot-daemon.service`:
 
 ```ini
 [Unit]
@@ -102,51 +107,51 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/btrfs-home-snapshots daemon --interval 5
+ExecStart=/usr/local/sbin/btrfs-snapshot-daemon --interval 5
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-Reload systemd's service definitions and enable the service:
+Enable and start the service:
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable --now btrfs-home-snapshots.service
+sudo systemctl enable --now btrfs-snapshot-daemon.service
 ```
 
-Check the service status and logs:
+Check the service and its logs:
 
 ```bash
-sudo systemctl status btrfs-home-snapshots.service
-sudo journalctl -u btrfs-home-snapshots.service
+sudo systemctl status btrfs-snapshot-daemon.service
+sudo journalctl -u btrfs-snapshot-daemon.service
 ```
 
-The daemon checks accounts every five seconds. It skips accounts with a UID below `1000`, skips the `nobody` account, and only processes accounts that have a matching directory under `/home`. It creates a snapshot when the daemon first runs, then creates no more than one daily snapshot per user for each calendar day.
-
-To stop and disable the service:
+Stop and disable it:
 
 ```bash
-sudo systemctl disable --now btrfs-home-snapshots.service
+sudo systemctl disable --now btrfs-snapshot-daemon.service
 ```
 
-## Snapshot location and behavior
+The daemon scans accounts every five seconds. It skips accounts with a UID below `1000`, skips the `nobody` account, and processes accounts with a matching directory under `/home`. It creates no more than one daily snapshot per account per calendar day.
 
-Snapshots are stored in this layout:
+## Snapshot behavior and location
+
+Snapshots use this layout:
 
 ```text
 /home/.snapshots/<username>/daily-YYYY-MM-DD
-/home/.snapshots/<username>/manual-YYYY-MM-DD_HH-MM-SS
+/home/.snapshots/<username>/manual-YYYY-MM-DD_HH-MM-SS-microseconds
 ```
 
-Snapshots are **writable**: the Btrfs snapshot command does not use the read-only option. Changes made inside a snapshot do not automatically change the original home subvolume, and changes to the original do not automatically update the snapshot.
+Snapshots are writable: the manager does not pass Btrfs's read-only option. Changes made inside a snapshot are separate from changes to the original subvolume.
 
-Snapshots are accessible at the paths above through the existing `/home` mount. The script does not separately mount snapshots.
+The snapshots are accessible through the existing `/home` mount. The scripts do not separately mount snapshots.
 
 ## Important notes
 
-- This script does **not** modify or reload `/etc/fstab`. Snapshots under the existing `/home` mount do not require separate `fstab` entries.
-- Snapshots are stored on the same filesystem as `/home`; they are not a substitute for backups on another disk or system.
-- The script assumes home subvolumes are mounted as `/home/<username>`. If your Btrfs layout uses a subvolume such as `@` mounted elsewhere, change the `source` path in the script to match your actual mounted layout.
-- The script does not delete old snapshots. Add a separate retention policy only after deciding how long snapshots should be kept.
+- These scripts do **not** modify or reload `/etc/fstab`. Snapshots stored under `/home` do not require separate `fstab` entries.
+- Snapshots are on the same filesystem as the original data. They are not a substitute for backups on another disk or system.
+- The scripts assume each home subvolume is mounted at `/home/<username>`. If your Btrfs layout mounts home subvolumes from another path, update `HOME_ROOT` in both scripts.
+- The daemon does not delete old snapshots. Add a retention policy separately if you need automatic cleanup.
